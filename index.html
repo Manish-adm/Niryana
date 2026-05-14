@@ -266,21 +266,32 @@ const C={
 };
 
 // ─── SHEETS API ────────────────────────────
-async function api(action,payload={}){
-  if(!CFG.url) throw new Error('NOT_CONFIGURED');
-  const r=await fetch(CFG.url,{
-    method:'POST',
-    headers:{'Content-Type':'text/plain'},
-    body:JSON.stringify({action,...payload})
-  });
-  if(!r.ok) throw new Error('HTTP '+r.status);
-  const d=await r.json();
+// Uses GET + URLSearchParams — the only CORS-safe method for
+// Google Apps Script Web Apps called from external HTML pages.
+// Data is base64-encoded to safely pass JSON through URL params.
+
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbyIBBWhkV7lh9UUlJR4h0bGdo260WghrV-PLHn0Dz376OqPG42WKjorV0DSTWBqtYLl/exec';
+
+async function api(action, payload={}) {
+  const url = CFG.url || GAS_URL;
+  const data = btoa(unescape(encodeURIComponent(JSON.stringify({action,...payload}))));
+  const full = url + '?d=' + encodeURIComponent(data) + '&t=' + Date.now();
+  const r = await fetch(full, {method:'GET', redirect:'follow'});
+  if(!r.ok) throw new Error('HTTP ' + r.status);
+  const txt = await r.text();
+  // GAS sometimes wraps in callback or extra chars — strip safely
+  const clean = txt.trim().replace(/^[^{[]*/, '').replace(/[^}\]]*$/, '');
+  const d = JSON.parse(clean);
   if(d.error) throw new Error(d.error);
   return d;
 }
 async function sheetGet(s){const d=await api('get',{sheet:s});C.set(s,d.rows||[]);return d.rows||[];}
-async function sheetAdd(s,row){await api('add',{sheet:s,row});C.bust(s);}
-async function sheetDel(s,id){await api('delete',{sheet:s,id});C.bust(s);}
+async function sheetAdd(s,row){
+  // Strip fileData (base64 images) before sending to Sheets — too large for URL
+  const r={...row};if(r.fileData&&r.fileData.length>500)r.fileData='[attachment]';
+  await api('add',{sheet:s,row:r});
+}
+async function sheetDel(s,id){await api('delete',{sheet:s,id});}
 
 // ─── HELPERS ───────────────────────────────
 const ID=()=>Date.now().toString(36)+Math.random().toString(36).slice(2,6);
@@ -964,7 +975,7 @@ function showSetup(){
         <div class="step" style="margin-bottom:0">
           <div class="step-n">4</div>
           <div class="step-t"><strong style="color:var(--ink);display:block;margin-bottom:6px">Paste Web App URL below</strong>
-            <input id="cfg-url" type="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(CFG.url||'')}" style="font-size:12px">
+            <input id="cfg-url" type="url" placeholder="https://script.google.com/macros/s/…/exec" value="${esc(CFG.url||GAS_URL)}" style="font-size:12px">
           </div>
         </div>
       </div>
@@ -977,23 +988,30 @@ function showSetup(){
 }
 
 function getScript(){
-return `// Niryana — Apps Script Backend
-// Deploy as Web App: Execute as Me, Access Anyone
+return `// Niryana — Apps Script Backend v2
+// IMPORTANT: Deploy as Web App
+//   Execute as: Me
+//   Who has access: Anyone
+// Uses doGet (GET requests) — required for CORS from external HTML
 
-function doPost(e) {
+function doGet(e) {
   try {
-    const p = JSON.parse(e.postData.contents);
+    // Decode base64 payload sent as ?d=...
+    const raw = e.parameter.d || '{}';
+    const p = JSON.parse(decodeURIComponent(escape(Utilities.base64Decode(raw, Utilities.Charset.UTF_8).map(b=>String.fromCharCode(b)).join(''))));
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const shName = {ledger:'Ledger',personal:'Personal',notes:'Notes'}[p.sheet]||p.sheet;
+    const names = {ledger:'Ledger', personal:'Personal', notes:'Notes'};
+    const shName = names[p.sheet] || p.sheet || 'Ledger';
     let sh = ss.getSheetByName(shName);
     if(!sh) sh = ss.insertSheet(shName);
     let result = {};
-    if(p.action==='get') result = {rows: readAll(sh)};
-    else if(p.action==='add') { appendRow(sh, p.row); result = {ok:true}; }
-    else if(p.action==='delete') { delRow(sh, p.id); result = {ok:true}; }
+    if(p.action === 'get')    { result = {rows: readAll(sh)}; }
+    else if(p.action === 'add')    { appendRow(sh, p.row); result = {ok:true}; }
+    else if(p.action === 'delete') { delRow(sh, p.id);  result = {ok:true}; }
+    else { result = {rows: readAll(sh)}; }
     return out(result);
   } catch(err) {
-    return out({error: err.message});
+    return out({error: err.toString()});
   }
 }
 
@@ -1004,26 +1022,42 @@ function out(obj) {
 }
 
 function readAll(sh) {
-  const d = sh.getDataRange().getValues();
-  if(d.length < 2) return [];
-  const h = d[0];
-  return d.slice(1).map(row => {
-    const o = {};
-    h.forEach((k,i) => o[k] = String(row[i]||''));
-    return o;
+  const data = sh.getDataRange().getValues();
+  if(data.length < 2) return [];
+  const headers = data[0];
+  return data.slice(1).map(row => {
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = String(row[i] === undefined ? '' : row[i]); });
+    return obj;
   });
 }
 
 function appendRow(sh, row) {
-  if(sh.getLastRow() === 0) sh.appendRow(Object.keys(row));
-  sh.appendRow(Object.values(row));
+  if(!row) return;
+  const keys = Object.keys(row);
+  if(sh.getLastRow() === 0) {
+    sh.appendRow(keys);
+  } else {
+    // Ensure columns match headers
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
+    const vals = headers.map(h => row[h] !== undefined ? row[h] : '');
+    sh.appendRow(vals);
+    return;
+  }
+  sh.appendRow(keys.map(k => row[k]));
 }
 
 function delRow(sh, id) {
-  const d = sh.getDataRange().getValues();
-  const ci = d[0].indexOf('id');
-  for(let i=d.length-1;i>=1;i--) {
-    if(String(d[i][ci])===String(id)) { sh.deleteRow(i+1); return; }
+  if(!id) return;
+  const data = sh.getDataRange().getValues();
+  if(data.length < 2) return;
+  const idCol = data[0].indexOf('id');
+  if(idCol < 0) return;
+  for(let i = data.length - 1; i >= 1; i--) {
+    if(String(data[i][idCol]) === String(id)) {
+      sh.deleteRow(i + 1);
+      return;
+    }
   }
 }`;
 }
@@ -1036,20 +1070,23 @@ function copyScript(){
 }
 
 async function connectSheets(){
-  const url=document.getElementById('cfg-url')?.value?.trim();
+  const url=(document.getElementById('cfg-url')?.value?.trim()) || GAS_URL;
   if(!url){toast('⚠ Paste the Web App URL');return;}
-  toast('Testing…');
+  const btn=document.querySelector('.sh-foot .btn-primary');
+  if(btn){btn.innerHTML='<span class="spinner"></span> Testing…';btn.disabled=true;}
+  toast('Testing connection…');
   try{
     CFG.url=url;
-    await sheetGet('ledger');
+    const rows=await sheetGet('ledger');
     localStorage.setItem(CFG_KEY,JSON.stringify(CFG));
-    toast('✓ Connected! Syncing now…');
+    toast('✓ Connected! '+rows.length+' ledger rows loaded.');
     closeSheet();
     await syncAll(true);
     render(curPage);
   }catch(e){
     CFG.url='';
-    toast('⚠ Failed. Check URL and try again.');
+    if(btn){btn.innerHTML='Connect & Test';btn.disabled=false;}
+    toast('⚠ Error: '+e.message+'. Re-deploy script and try again.');
   }
 }
 
@@ -1085,8 +1122,16 @@ function closeSheet(){document.querySelectorAll('#sht').forEach(e=>e.remove());}
 // ─── BOOT ──────────────────────────────────
 document.getElementById('tb-date').textContent=
   new Date().toLocaleDateString('en-IN',{day:'2-digit',month:'short'});
+
+// Auto-save your URL if not yet configured
+if(!CFG.url){
+  CFG.url = GAS_URL;
+  localStorage.setItem(CFG_KEY, JSON.stringify(CFG));
+}
+
 renderHome();
-if(CFG.url) setTimeout(()=>syncAll(true),800);
+// Sync on load
+setTimeout(()=>syncAll(true), 800);
 </script>
 </body>
 </html>
